@@ -1,0 +1,278 @@
+---
+title: "Clustering-Based Sector Rotation with Kalman Filter Signals"
+subtitle: "FIN 452 — Quantitative Trading Model"
+author: "Nursultan Berdibek"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-summary: "Show code"
+    fig-width: 10
+    fig-height: 6
+    fig-dpi: 150
+    theme: cosmo
+execute:
+  cache: true
+  message: false
+  warning: false
+  echo: true
+---
+
+```{r setup}
+#| cache: false
+
+# ── Packages ──────────────────────────────────────────────────────────────────
+library(tidyverse)
+library(tidyquant)
+library(TTR)
+library(tidymodels)
+library(tidyclust)
+library(factoextra)
+library(KFAS)
+library(PerformanceAnalytics)
+library(plotly)
+library(patchwork)
+library(gt)
+library(lubridate)
+library(scales)
+
+# ── Global Constants ──────────────────────────────────────────────────────────
+TICKERS <- c("SPY", "XLB", "XLC", "XLE", "XLF",
+             "XLI", "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY")
+
+SECTOR_NAMES <- c(
+  SPY  = "S&P 500 (Benchmark)",
+  XLB  = "Materials",
+  XLC  = "Communication Services",
+  XLE  = "Energy",
+  XLF  = "Financials",
+  XLI  = "Industrials",
+  XLK  = "Technology",
+  XLP  = "Consumer Staples",
+  XLRE = "Real Estate",
+  XLV  = "Health Care",
+  XLU  = "Utilities",
+  XLY  = "Consumer Discretionary"
+)
+
+TRAIN_START <- as.Date("2000-06-01")
+TRAIN_END   <- as.Date("2024-12-31")
+TEST_START  <- as.Date("2025-01-01")
+TEST_END    <- as.Date("2026-03-31")
+
+N_CLUSTERS       <- 3L       # justified via elbow plot in Section 4
+MOMENTUM_WINDOW  <- 6L       # months for favored-cluster labeling
+KF_INNOV_CLIP_SD <- 3.0      # clip KF innovations beyond ±3 SD
+TC_BPS           <- 0.0010   # 10 bps one-way transaction cost
+
+set.seed(452)
+```
+
+```{r pkg-versions}
+#| cache: false
+#| tbl-cap: "Package versions used in this analysis"
+
+pkgs <- c("tidyverse", "tidyquant", "TTR", "tidymodels", "tidyclust",
+          "factoextra", "KFAS", "PerformanceAnalytics", "plotly",
+          "patchwork", "gt", "lubridate", "scales")
+
+tibble(
+  Package = pkgs,
+  Version = map_chr(pkgs, \(p) as.character(packageVersion(p)))
+) |>
+  gt() |>
+  tab_header(title = "R Package Versions") |>
+  cols_align("left")
+```
+
+# Introduction & Strategy Overview
+
+This report implements a **clustering-based sector rotation strategy** applied to the eleven S&P 500 Select Sector SPDR ETFs, using SPY as a benchmark. The strategy combines two complementary methods:
+
+1. **K-Means Clustering** groups sectors by their return and momentum characteristics each month. The cluster with the strongest trailing momentum is designated the *favored* cluster — the universe eligible for investment.
+
+2. **Kalman Filter** fits a local-level state-space model to each sector's return history. The one-step-ahead *innovation* (observed minus predicted) measures whether a sector is outperforming its recent trend. Only sectors in the favored cluster with a positive Kalman innovation receive a positive allocation.
+
+Portfolio weights are normalized to sum to 100% (long-only). Monthly rebalancing occurs on the last trading day of each month, with execution assumed at the same day's closing price. A 10 bps one-way transaction cost is applied proportional to weight changes.
+
+**Training period:** June 2000 – December 2024
+**Testing period:** January 2025 – March 2026
+
+# Data Acquisition & Validation
+
+## Pulling Price Data
+
+All data is sourced from Yahoo Finance via the `tidyquant` package. No local data files are used. Adjusted closing prices account for dividends and splits.
+
+```{r pull-prices}
+prices_raw <- tq_get(
+  TICKERS,
+  from = TRAIN_START,
+  to   = TEST_END,
+  get  = "stock.prices"
+)
+```
+
+## Ticker Availability
+
+XLC (Communication Services) launched on 2018-06-19 and XLRE (Real Estate) on 2015-10-07. These tickers return fewer observations than the others. An eligibility check ensures they are excluded from portfolio allocation before their respective inception dates.
+
+```{r ticker-availability}
+#| tbl-cap: "Observation counts and first available date per ticker"
+
+ticker_meta <- prices_raw |>
+  group_by(symbol) |>
+  summarise(
+    first_date = min(date),
+    last_date  = max(date),
+    n_obs      = n(),
+    .groups    = "drop"
+  ) |>
+  mutate(sector = SECTOR_NAMES[symbol])
+
+ticker_meta |>
+  select(symbol, sector, first_date, last_date, n_obs) |>
+  gt() |>
+  tab_header(title = "Ticker Availability") |>
+  cols_label(
+    symbol     = "Ticker",
+    sector     = "Sector",
+    first_date = "First Date",
+    last_date  = "Last Date",
+    n_obs      = "Observations"
+  ) |>
+  cols_align("left")
+```
+
+## Data Quality Checks
+
+We screen for: (1) NA adjusted prices, (2) zero-volume days, and (3) single-day price moves exceeding 50% (likely data errors despite using adjusted prices).
+
+```{r data-quality}
+#| tbl-cap: "Data quality flags per ticker"
+
+quality_flags <- prices_raw |>
+  group_by(symbol) |>
+  summarise(
+    na_price      = sum(is.na(adjusted)),
+    zero_volume   = sum(volume == 0, na.rm = TRUE),
+    extreme_moves = sum(
+      abs(adjusted / lag(adjusted) - 1) > 0.50,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+quality_flags |>
+  gt() |>
+  tab_header(title = "Data Quality Flags") |>
+  cols_label(
+    symbol        = "Ticker",
+    na_price      = "NA Prices",
+    zero_volume   = "Zero-Volume Days",
+    extreme_moves = ">50% Daily Move"
+  ) |>
+  data_color(
+    columns = c(na_price, zero_volume, extreme_moves),
+    method  = "numeric",
+    palette = c("white", "orange")
+  )
+```
+
+## Daily Returns
+
+```{r daily-returns}
+returns_daily <- prices_raw |>
+  group_by(symbol) |>
+  tq_transmute(
+    select     = adjusted,
+    mutate_fun = periodReturn,
+    period     = "daily",
+    col_rename = "daily_ret"
+  ) |>
+  ungroup()
+```
+
+## Monthly Returns
+
+Monthly returns are used for rebalancing signal computation and portfolio performance tracking. We use end-of-month closing prices.
+
+```{r monthly-returns}
+returns_monthly <- prices_raw |>
+  group_by(symbol) |>
+  tq_transmute(
+    select     = adjusted,
+    mutate_fun = periodReturn,
+    period     = "monthly",
+    col_rename = "monthly_ret"
+  ) |>
+  ungroup() |>
+  # date is set to last trading day of each month by tq_transmute
+  rename(month_end = date)
+```
+
+## Price History Visualization
+
+```{r price-chart}
+#| fig-cap: "Adjusted price history for all tickers (rebased to 100 at each series start)"
+
+rebased <- prices_raw |>
+  group_by(symbol) |>
+  mutate(rebased = adjusted / first(adjusted) * 100) |>
+  ungroup() |>
+  mutate(sector = SECTOR_NAMES[symbol])
+
+p <- ggplot(rebased, aes(x = date, y = rebased, color = symbol)) +
+  geom_line(linewidth = 0.5, alpha = 0.85) +
+  geom_vline(xintercept = as.numeric(TEST_START),
+             linetype = "dashed", color = "grey40") +
+  annotate("text", x = TEST_START, y = max(rebased$rebased, na.rm = TRUE) * 0.95,
+           label = "Test period →", hjust = -0.1, size = 3.5, color = "grey40") +
+  scale_y_continuous(labels = label_comma()) +
+  scale_color_brewer(palette = "Paired") +
+  labs(title = "Rebased Price History (base = 100 at inception)",
+       x = NULL, y = "Rebased Price", color = "Ticker") +
+  theme_minimal(base_size = 12)
+
+ggplotly(p, tooltip = c("x", "y", "colour")) |>
+  layout(hovermode = "x unified")
+```
+
+```{r returns-summary}
+#| tbl-cap: "Annualized return and volatility over the full training period"
+
+train_summary <- returns_daily |>
+  filter(date >= TRAIN_START, date <= TRAIN_END) |>
+  group_by(symbol) |>
+  summarise(
+    ann_return = prod(1 + daily_ret, na.rm = TRUE)^(252 / n()) - 1,
+    ann_vol    = sd(daily_ret, na.rm = TRUE) * sqrt(252),
+    sharpe     = ann_return / ann_vol,
+    .groups    = "drop"
+  ) |>
+  mutate(sector = SECTOR_NAMES[symbol]) |>
+  arrange(desc(ann_return))
+
+train_summary |>
+  select(symbol, sector, ann_return, ann_vol, sharpe) |>
+  gt() |>
+  tab_header(title = "Training Period Summary (Jun 2000 – Dec 2024)") |>
+  cols_label(
+    symbol     = "Ticker",
+    sector     = "Sector",
+    ann_return = "Ann. Return",
+    ann_vol    = "Ann. Volatility",
+    sharpe     = "Sharpe (rf=0)"
+  ) |>
+  fmt_percent(columns = c(ann_return, ann_vol), decimals = 1) |>
+  fmt_number(columns = sharpe, decimals = 2) |>
+  data_color(
+    columns = sharpe,
+    method  = "numeric",
+    palette = c("tomato", "white", "steelblue")
+  )
+```
