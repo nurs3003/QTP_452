@@ -1,7 +1,7 @@
 ---
 title: "Clustering-Based Sector Rotation with Kalman Filter Signals"
 subtitle: "FIN 452 — Quantitative Trading Model"
-author: "Nursultan Berdibek"
+author: "Nursultan Amangeldiev"
 date: today
 format:
   html:
@@ -91,13 +91,21 @@ tibble(
 
 # Introduction & Strategy Overview
 
-This report implements a **clustering-based sector rotation strategy** applied to the eleven S&P 500 Select Sector SPDR ETFs, using SPY as a benchmark. The strategy combines two complementary methods:
+This report implements a **clustering-based sector rotation strategy** applied to the eleven S&P 500 Select Sector SPDR ETFs, using SPY as a benchmark. The strategy is a long-biased active fund with a short overlay, targeting returns above the index by going long on the strongest sectors and shorting the weakest. It combines two complementary methods:
 
-1. **K-Means Clustering** groups sectors by their return and momentum characteristics each month. The cluster with the strongest trailing momentum is designated the *favored* cluster — the universe eligible for investment.
+1. **K-Means Clustering** groups sectors by their return and momentum characteristics each month. The cluster with the strongest trailing momentum is the *favored* cluster (long-eligible); the cluster with the weakest is the *unfavored* cluster (short-eligible).
 
-2. **Kalman Filter** fits a local-level state-space model to each sector's return history. The one-step-ahead *innovation* (observed minus predicted) measures whether a sector is outperforming its recent trend. Only sectors in the favored cluster with a positive Kalman innovation receive a positive allocation.
+2. **Kalman Filter** fits a local-level state-space model to each sector's return history. The one-step-ahead *innovation* (observed minus predicted return) measures whether a sector is outperforming or underperforming its recent trend. The sign and magnitude of the innovation triggers and sizes the trade.
 
-Portfolio weights are normalized to sum to 100% (long-only). Monthly rebalancing occurs on the last trading day of each month, with execution assumed at the same day's closing price. A 10 bps one-way transaction cost is applied proportional to weight changes.
+**Signal combination rule:**
+
+| Condition | Position |
+|-----------|----------|
+| Favored cluster + positive KF innovation | **Long** (weights sum to +100%) |
+| Unfavored cluster + negative KF innovation | **Short** (weights sum to −30%) |
+| All other sectors | **Flat** (0%) |
+
+Net portfolio exposure is **+70%**, consistent with a long-biased active fund. Monthly rebalancing occurs on the last trading day of each month, with execution assumed at the same day's closing price. A 10 bps one-way transaction cost is applied proportional to weight changes.
 
 **Training period:** June 2000 – December 2024
 **Testing period:** January 2025 – March 2026
@@ -275,4 +283,165 @@ train_summary |>
     method  = "numeric",
     palette = c("tomato", "white", "steelblue")
   )
+```
+
+# Feature Engineering
+
+Features are computed on daily price data and sampled at each month-end. The clustering unit is a **ticker × month** observation: each row represents one sector at one point in time, described by a vector of indicators. All normalization parameters are estimated on the training set only and applied to the test set — preventing look-ahead bias.
+
+## Computing Indicators
+
+We compute seven features per ticker per day using `TTR`:
+
+| Feature | Description |
+|---------|-------------|
+| `mom_1m` | 1-month trailing return |
+| `mom_3m` | 3-month trailing return |
+| `mom_6m` | 6-month trailing return |
+| `mom_12m` | 12-month trailing return |
+| `trend_ratio` | 50-day SMA ÷ 200-day SMA (price relative to long-term trend) |
+| `vol_20d` | 20-day realized annualized volatility |
+| `rsi_14` | 14-day Relative Strength Index |
+
+Momentum features capture cross-sectional relative strength. The trend ratio flags whether a sector is in a short-term uptrend relative to its own history. Volatility and RSI add regime context that clustering can exploit.
+
+```{r compute-indicators}
+# Helper: compute all features for a single ticker's price series
+compute_features <- function(df) {
+  df <- df |> arrange(date)
+  n  <- nrow(df)
+  p  <- df$adjusted
+
+  # Rolling returns at various horizons (approximate trading days)
+  ret_1m  <- p / lag(p, 21)  - 1
+  ret_3m  <- p / lag(p, 63)  - 1
+  ret_6m  <- p / lag(p, 126) - 1
+  ret_12m <- p / lag(p, 252) - 1
+
+  sma50  <- SMA(p, n = 50)
+  sma200 <- SMA(p, n = 200)
+
+  # Daily log returns for realized vol
+  log_ret <- c(NA, diff(log(p)))
+  vol_20d <- rollapply(log_ret, width = 20, FUN = sd, fill = NA, align = "right") * sqrt(252)
+
+  rsi_14 <- RSI(p, n = 14)
+
+  df |>
+    mutate(
+      mom_1m      = ret_1m,
+      mom_3m      = ret_3m,
+      mom_6m      = ret_6m,
+      mom_12m     = ret_12m,
+      trend_ratio = sma50 / sma200,
+      vol_20d     = vol_20d,
+      rsi_14      = rsi_14
+    ) |>
+    select(symbol, date, mom_1m, mom_3m, mom_6m, mom_12m,
+           trend_ratio, vol_20d, rsi_14)
+}
+
+features_daily <- prices_raw |>
+  group_by(symbol) |>
+  group_modify(~ compute_features(.x)) |>
+  ungroup()
+```
+
+## Sampling at Month-End
+
+We join daily features to the monthly return dates to get one feature snapshot per ticker per month-end rebalancing date.
+
+```{r month-end-features}
+# Month-end dates from the returns_monthly table (covers full date range)
+month_ends <- returns_monthly |>
+  select(symbol, month_end) |>
+  distinct()
+
+features_monthly <- features_daily |>
+  inner_join(month_ends, by = c("symbol", "date" = "month_end")) |>
+  rename(month_end = date) |>
+  arrange(symbol, month_end)
+```
+
+## Train / Test Split
+
+```{r feature-split}
+features_train <- features_monthly |>
+  filter(month_end >= TRAIN_START, month_end <= TRAIN_END)
+
+features_test <- features_monthly |>
+  filter(month_end >= TEST_START, month_end <= TEST_END)
+
+cat(
+  "Training observations:", nrow(features_train),
+  "\nTest observations:    ", nrow(features_test)
+)
+```
+
+## Tidymodels Recipe
+
+The recipe imputes missing values first (median of each feature, computed on training data), then normalizes all features to zero mean and unit variance. This order matters: imputing before normalization means the imputed value equals the training median, which after scaling maps to 0 — the most neutral possible value for a missing observation.
+
+```{r feature-recipe}
+FEATURE_COLS <- c("mom_1m", "mom_3m", "mom_6m", "mom_12m",
+                  "trend_ratio", "vol_20d", "rsi_14")
+
+cluster_recipe <- recipe(~ ., data = features_train) |>
+  update_role(symbol, month_end, new_role = "id") |>
+  step_impute_median(all_of(FEATURE_COLS)) |>
+  step_normalize(all_of(FEATURE_COLS))
+
+# Prep on training data only
+cluster_recipe_prepped <- prep(cluster_recipe, training = features_train)
+
+# Bake both sets using training statistics
+features_train_baked <- bake(cluster_recipe_prepped, new_data = features_train)
+features_test_baked  <- bake(cluster_recipe_prepped, new_data = features_test)
+```
+
+## Feature Distributions
+
+```{r feature-distributions}
+#| fig-cap: "Distribution of normalized features across all sectors and training months"
+#| fig-height: 7
+
+features_train_baked |>
+  pivot_longer(all_of(FEATURE_COLS), names_to = "feature", values_to = "value") |>
+  mutate(feature = factor(feature, levels = FEATURE_COLS)) |>
+  ggplot(aes(x = value, fill = feature)) +
+  geom_histogram(bins = 40, color = "white", linewidth = 0.2, show.legend = FALSE) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 2) +
+  labs(title = "Normalized Feature Distributions (Training Set)",
+       x = "Normalized Value", y = "Count") +
+  theme_minimal(base_size = 11)
+```
+
+## Feature Correlation
+
+```{r feature-correlation}
+#| fig-cap: "Pairwise correlation of normalized features (training set)"
+#| fig-height: 6
+
+cor_mat <- features_train_baked |>
+  select(all_of(FEATURE_COLS)) |>
+  cor(use = "pairwise.complete.obs")
+
+cor_df <- cor_mat |>
+  as.data.frame() |>
+  rownames_to_column("feature_x") |>
+  pivot_longer(-feature_x, names_to = "feature_y", values_to = "correlation") |>
+  mutate(
+    feature_x = factor(feature_x, levels = FEATURE_COLS),
+    feature_y = factor(feature_y, levels = rev(FEATURE_COLS))
+  )
+
+ggplot(cor_df, aes(x = feature_x, y = feature_y, fill = correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(correlation, 2)), size = 3.5) +
+  scale_fill_gradient2(low = "tomato", mid = "white", high = "steelblue",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Feature Correlation Matrix (Training Set)",
+       x = NULL, y = NULL, fill = "Correlation") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
 ```

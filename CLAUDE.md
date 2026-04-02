@@ -66,6 +66,17 @@ No local data files (CSV, Excel, RDS, etc.) are permitted. All data must be load
 - **Clustering** is the primary method for driving signals from the indicator mental model.
 - **Kalman Filter** must be used in conjunction with clustering to trigger trade signals.
 - Any additional indicators are allowed and encouraged to improve strategy quality.
+- **Short selling is permitted.** The strategy is long-biased with a short overlay.
+
+### Weight Allocation — Long/Flat/Short
+
+| Signal | Condition | Weight |
+|--------|-----------|--------|
+| **Long** | Favored cluster (highest 6M trailing momentum) AND positive KF innovation | Proportional to innovation magnitude, normalized to **+100%** |
+| **Short** | Unfavored cluster (lowest 6M trailing momentum) AND negative KF innovation | Proportional to \|innovation\|, normalized to **−30%** |
+| **Flat** | All other sectors | 0% |
+
+Net exposure: **+70%**. The strategy must demonstrate active management value above SPY.
 - Decision rules must be clearly stated in the document and visualized using **Mermaid diagrams** (mermaid.ai). The code must match the mental model shown in the diagram.
 
 ## Workflow and Tooling
