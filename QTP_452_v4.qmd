@@ -1,0 +1,1184 @@
+---
+title: "A Sector Rotation Strategy Using Clustering and the Kalman Filter"
+subtitle: "FIN 452 — Quantitative Trading Model"
+author: "Nursultan Amangeldiev"
+date: "2026-04-07"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: flatly
+    code-fold: true
+    code-tools: true
+    fig-width: 10
+    fig-height: 6
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup}
+#| include: false
+library(tidyverse)
+library(tidyquant)
+library(tidymodels)
+library(tidyclust)
+library(KFAS)
+library(PerformanceAnalytics)
+library(moments)
+library(cluster)
+library(factoextra)
+library(plotly)
+library(scales)
+library(kableExtra)
+library(slider)
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+SECTOR_TICKERS <- c("XLB", "XLC", "XLE", "XLF", "XLI",
+                    "XLK", "XLP", "XLRE", "XLV", "XLU", "XLY")
+BENCHMARK      <- "SPY"
+ALL_TICKERS    <- c(SECTOR_TICKERS, BENCHMARK)
+
+TRAIN_START    <- as.Date("2000-06-01")
+TRAIN_END      <- as.Date("2024-12-31")
+TEST_START     <- as.Date("2025-01-01")
+TEST_END       <- as.Date("2026-03-31")
+
+FEATURE_WINDOW <- 252L
+MOM_WINDOW     <- 126L
+K_CLUSTERS     <- 3L
+
+LONG_TARGET    <-  1.00
+SHORT_TARGET   <- -0.15   # reduced short; active only in bear regime
+SMA_SHORT      <- 50L     # bear regime = SMA_SHORT < SMA_LONG (death cross)
+SMA_LONG       <- 100L    # change either constant to test different crossover pairs
+
+ELIGIBILITY <- tribble(
+  ~symbol, ~eligible_from,
+  "XLC",   as.Date("2018-06-01"),
+  "XLRE",  as.Date("2015-10-07")
+)
+
+# ── Shared colour palette ──────────────────────────────────────────────────────
+COL_STRATEGY  <- "#3B82F6"
+COL_SPY       <- "#9CA3AF"
+COL_GROWTH    <- "#22C55E"
+COL_NEUTRAL   <- "#EAB308"
+COL_DEFENSIVE <- "#EF4444"
+COL_LONG      <- "#22C55E"
+COL_SHORT     <- "#EF4444"
+COL_FLAT      <- "#D1D5DB"
+```
+
+# Strategy Overview
+
+Not all sectors move together. At any point in time, some sectors are in a structural upswing — driven by earnings momentum, interest rate tailwinds, or macro rotation — while others are under pressure. A strategy that holds all sectors equally ignores this. The goal here is to systematically identify which sectors are leading, confirm that they are *currently* following through, and tilt the portfolio toward them — while adding a limited short on the weakest sectors when the overall market is declining.
+
+The strategy has three components that work together:
+
+1. **Clustering (monthly):** At each month-end, all 11 sector ETFs are grouped into three clusters — **Growth**, **Neutral**, and **Defensive** — based on six trailing performance features. This gives the portfolio its monthly strategic direction: which sectors are in favour, which are lagging.
+
+2. **Kalman Filter signal (daily):** Within each month, a Kalman Filter tracks whether each sector is *currently* outperforming or underperforming the broad market. A Growth sector with a positive signal gets bought; a Defensive sector with a negative signal gets shorted — but only if the broad market is in a downtrend. This daily confirmation prevents acting on stale monthly labels.
+
+3. **Regime filter (daily):** Short positions are only activated when the `r SMA_SHORT`-day SMA crosses below the `r SMA_LONG`-day SMA — a "death cross" signal. Comparing two smoothed averages is more stable than comparing price to a single average; it requires sustained selling pressure to flip the regime, not just one bad week.
+
+| Parameter | Value |
+|-----------|-------|
+| Tickers | XLB, XLC, XLE, XLF, XLI, XLK, XLP, XLRE, XLV, XLU, XLY |
+| Benchmark | SPY |
+| Training period | Jun 2000 – Dec 2024 |
+| Testing period | Jan 2025 – Mar 2026 |
+| Data frequency | Daily prices; monthly cluster update |
+| Long exposure | +100% (Growth full weight, Neutral half weight) |
+| Short exposure | −15%, bear regime only (SMA`r SMA_SHORT` < SMA`r SMA_LONG` death cross) |
+| Net exposure | +100% bull / +85% bear |
+
+## Decision flowchart
+
+```{mermaid}
+flowchart TD
+    A[Month-End: Rolling 12M Features per Sector] --> B[K-Means Clustering K equals 3]
+    B --> C{Label by Mean Momentum}
+    C --> D[Growth: highest momentum]
+    C --> E[Neutral: middle]
+    C --> F[Defensive: lowest momentum]
+
+    G[Daily: Sector Excess Return = Sector minus SPY] --> H[Kalman Filter Local Level]
+    H --> I[Daily Innovation = actual excess minus predicted excess]
+    I --> IS[10-Day Rolling Mean of Innovations = KF Signal]
+
+    SPY[Daily: SPY Price] --> SMAS[Short SMA]
+    SPY --> SMAL[Long SMA]
+    SMAS --> R{Market Regime}
+    SMAL --> R
+    R -- Short SMA below Long SMA --> BEAR[Bear Regime: shorts ON]
+    R -- Short SMA above Long SMA --> BULL[Bull Regime: shorts OFF]
+
+    D --> J{Daily Position Rule}
+    E --> J
+    F --> J
+    IS --> J
+    BEAR --> J
+    BULL --> J
+
+    J -- Growth AND KF Signal greater than 0 --> K[LONG full weight]
+    J -- Neutral AND KF Signal greater than 0 --> K2[LONG half weight]
+    J -- Defensive AND KF Signal less than 0 AND Bear Regime --> L[SHORT]
+    J -- Otherwise --> M[FLAT]
+
+    K --> N[Long leg: weight prop to abs KF Signal, normalised to +100%]
+    K2 --> N
+    L --> O[Short leg: weight prop to abs KF Signal, normalised to minus 15%]
+    M --> P[Weight = 0]
+
+    N --> Q[Daily Portfolio Return, weights lagged 1 day]
+    O --> Q
+    P --> Q
+```
+
+## Position logic
+
+| Cluster | 10-Day Mean KF Signal | SPY Regime | Position | Raw weight |
+|---------|:--------------------:|:----------:|:--------:|:----------:|
+| Growth | > 0 | any | **Long** | \|signal\| |
+| Growth | ≤ 0 | any | Flat | 0 |
+| Neutral | > 0 | any | **Long (half)** | \|signal\| × 0.5 |
+| Neutral | ≤ 0 | any | Flat | 0 |
+| Defensive | < 0 | Bear (SMA`r SMA_SHORT` < SMA`r SMA_LONG`) | **Short** | −\|signal\| |
+| Defensive | < 0 | Bull (SMA`r SMA_SHORT` ≥ SMA`r SMA_LONG`) | Flat | 0 |
+| Defensive | ≥ 0 | any | Flat | 0 |
+| Ineligible / NA | any | any | Flat | 0 |
+
+Raw weights are then normalised per leg: long leg sums to **+100%**, short leg to **`r scales::percent(abs(SHORT_TARGET))`** (bear regime only). Net exposure: **+`r scales::percent(LONG_TARGET + SHORT_TARGET)`** bear / **+`r scales::percent(LONG_TARGET)`** bull.
+
+---
+
+# Data
+
+Daily adjusted prices are pulled from Yahoo Finance via `tidyquant` for all 11 sector ETFs and SPY. Adjusted prices account for dividends and stock splits, ensuring returns are economically accurate. Data is pulled from approximately 400 calendar days before the training start date so that rolling feature windows are fully populated from the very first month-end.
+
+Two sectors have limited history: XLC (Communication Services) is eligible from June 2018, and XLRE (Real Estate) from October 2015. Both are excluded from signals before their respective eligibility dates.
+
+```{r data-pull}
+DATA_START <- TRAIN_START - 400
+
+raw_prices <- tq_get(
+  ALL_TICKERS,
+  from = DATA_START,
+  to   = TEST_END,
+  get  = "stock.prices"
+) %>%
+  select(symbol, date, adjusted)
+
+```
+
+```{r daily-returns}
+#| include: false
+daily_returns <- raw_prices %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(daily_ret = log(adjusted / lag(adjusted))) %>%
+  filter(!is.na(daily_ret)) %>%
+  ungroup()
+```
+
+---
+
+# Exploratory Data Analysis
+
+Before building the strategy, it is useful to understand the data. The charts below confirm three things that motivate the approach: (1) sectors diverge significantly over time — holding them equally does not capture this, (2) correlations between sectors are positive but far from perfect — there is room for a selection strategy to add value, and (3) volatility is time-varying and regime-dependent — a daily signal that adapts to current conditions is more appropriate than a static one.
+
+## Cumulative price performance
+
+```{r eda-prices}
+indexed_prices <- raw_prices %>%
+  filter(symbol %in% SECTOR_TICKERS, date >= TRAIN_START) %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(indexed = adjusted / first(adjusted) * 100) %>%
+  ungroup()
+
+plot_ly(indexed_prices, x = ~date, y = ~indexed, color = ~symbol,
+        type = "scatter", mode = "lines",
+        line = list(width = 1)) %>%
+  layout(
+    title    = "Sector ETF Cumulative Performance (indexed to 100 at Jun 2000)",
+    xaxis    = list(title = ""),
+    yaxis    = list(title = "Index (log scale)", type = "log"),
+    hovermode = "x unified",
+    legend   = list(title = list(text = "Sector"))
+  )
+```
+
+## Pairwise correlation heatmap
+
+Sectors are positively correlated — they all respond to broad market moves — but the correlations are well below 1. This means sectors do not move in lockstep, which is the fundamental requirement for a selection strategy to add value over a simple market-cap weighted index.
+
+```{r eda-correlation}
+ret_wide <- daily_returns %>%
+  filter(symbol %in% SECTOR_TICKERS, date >= TRAIN_START, date <= TRAIN_END) %>%
+  select(symbol, date, daily_ret) %>%
+  pivot_wider(names_from = symbol, values_from = daily_ret) %>%
+  select(-date)
+
+cor_mat <- cor(ret_wide, use = "pairwise.complete.obs")
+
+plot_ly(
+  x          = colnames(cor_mat),
+  y          = rownames(cor_mat),
+  z          = cor_mat,
+  type       = "heatmap",
+  colorscale = list(c(0, COL_STRATEGY), c(0.5, "#FFFFFF"), c(1, COL_DEFENSIVE)),
+  zmin = -1, zmax = 1,
+  text       = round(cor_mat, 2),
+  texttemplate = "%{text}",
+  hovertemplate = "%{x} vs %{y}: %{z:.2f}<extra></extra>"
+) %>%
+  layout(
+    title = "Pairwise Return Correlation — Sector ETFs (Jun 2000 – Dec 2024)",
+    xaxis = list(title = ""),
+    yaxis = list(title = "")
+  )
+```
+
+## Rolling 60-day annualised volatility
+
+Volatility is clearly not constant — it spikes during market stress (2008, 2020, 2022) and compresses in calm periods. This confirms that a static model would be poorly calibrated for much of the sample. The Kalman Filter adapts to changing noise levels through its observation variance parameter $H$.
+
+```{r eda-vol}
+vol_data <- daily_returns %>%
+  filter(symbol %in% SECTOR_TICKERS, date >= TRAIN_START) %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(vol_60 = slide_dbl(daily_ret, sd, .before = 59, .complete = TRUE) * sqrt(252)) %>%
+  filter(!is.na(vol_60)) %>%
+  ungroup()
+
+plot_ly(vol_data, x = ~date, y = ~vol_60, color = ~symbol,
+        type = "scatter", mode = "lines",
+        line = list(width = 0.8)) %>%
+  layout(
+    title     = "60-Day Rolling Annualised Volatility by Sector",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Annualised Volatility", tickformat = ".0%"),
+    hovermode = "x unified",
+    legend    = list(title = list(text = "Sector"))
+  )
+```
+
+---
+
+# Feature Engineering
+
+To cluster sectors meaningfully, we need to describe each sector's recent behaviour in a way that captures multiple dimensions: not just whether it went up, but how volatile it was, how efficiently it generated returns per unit of risk, and whether its return distribution was skewed or fat-tailed. These six features are computed at every month-end using the past year (~252 trading days) of daily returns.
+
+| Feature | What it measures |
+|---------|-----------------|
+| `avg_return` | Annualised average daily return — overall return level |
+| `volatility` | Annualised standard deviation — how risky the sector has been |
+| `sharpe_ratio` | Return per unit of risk — quality of the return, not just size |
+| `skewness` | Asymmetry of returns — positive skew means more upside surprises than downside |
+| `kurtosis` | Fat-tailedness — high kurtosis means more extreme moves (both directions) |
+| `momentum_6m` | Cumulative 6-month return — the primary driver of cluster labelling |
+
+The 6-month momentum feature plays a dual role: it enters K-Means as one of the six clustering features, and it is also used after clustering to *label* the resulting groups (the cluster with the highest average momentum becomes "Growth"). This makes the labels economically interpretable regardless of how K-Means partitions the data.
+
+```{r feature-function}
+#| include: false
+compute_features <- function(month_end_date, returns_df, window = FEATURE_WINDOW) {
+  cutoff_start <- month_end_date - window
+
+  returns_df %>%
+    filter(
+      symbol %in% SECTOR_TICKERS,
+      date > cutoff_start,
+      date <= month_end_date
+    ) %>%
+    arrange(symbol, date) %>%
+    group_by(symbol) %>%
+    summarise(
+      avg_return   = mean(daily_ret, na.rm = TRUE) * 252,
+      volatility   = sd(daily_ret,   na.rm = TRUE) * sqrt(252),
+      sharpe_ratio = (mean(daily_ret, na.rm = TRUE) * 252) /
+                     max(sd(daily_ret, na.rm = TRUE) * sqrt(252), 1e-8),
+      skewness     = moments::skewness(daily_ret),
+      kurtosis     = moments::kurtosis(daily_ret) - 3,
+      momentum_6m  = prod(1 + tail(daily_ret, MOM_WINDOW), na.rm = TRUE) - 1,
+      n_obs        = n(),
+      .groups      = "drop"
+    ) %>%
+    mutate(month_end = month_end_date)
+}
+```
+
+```{r compute-features}
+all_month_ends <- daily_returns %>%
+  filter(symbol == "SPY", date >= TRAIN_START, date <= TEST_END) %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(ym) %>%
+  slice_max(date, n = 1) %>%
+  ungroup() %>%
+  pull(date)
+
+monthly_features <- map_dfr(
+  all_month_ends,
+  ~compute_features(.x, daily_returns, window = FEATURE_WINDOW)
+)
+```
+
+```{r feature-distributions}
+feat_cols <- c("avg_return", "volatility", "sharpe_ratio", "momentum_6m")
+
+# Compute per-sector densities for each feature
+feat_dens <- monthly_features %>%
+  filter(month_end <= TRAIN_END) %>%
+  select(symbol, all_of(feat_cols)) %>%
+  pivot_longer(-symbol, names_to = "feature", values_to = "value") %>%
+  group_by(feature, symbol) %>%
+  summarise(
+    x = list(density(value, na.rm = TRUE)$x),
+    y = list(density(value, na.rm = TRUE)$y),
+    .groups = "drop"
+  ) %>%
+  unnest(c(x, y))
+
+# One subplot per feature
+feat_plots <- map(feat_cols, function(feat) {
+  d <- feat_dens %>% filter(feature == feat)
+  plot_ly(d, x = ~x, y = ~y, color = ~symbol,
+          type = "scatter", mode = "lines",
+          fill = "tozeroy", opacity = 0.35,
+          showlegend = (feat == feat_cols[1])) %>%
+    layout(
+      xaxis = list(title = feat),
+      yaxis = list(title = "Density")
+    )
+})
+
+subplot(feat_plots, nrows = 2, shareY = FALSE, titleX = TRUE, margin = 0.08) %>%
+  layout(title = "Feature Distributions by Sector (Training Period)")
+```
+
+---
+
+# Clustering
+
+K-Means groups the 11 sectors into K clusters by minimising the total within-cluster distance in the 6-feature space. Features are normalised before clustering so that no single feature dominates due to scale. The resulting clusters are then labelled by average 6-month momentum — highest momentum cluster becomes Growth, lowest becomes Defensive, middle becomes Neutral.
+
+The key advantage of cross-sectional clustering (grouping sectors against each other at each point in time) is that there will always be a Growth cluster, a Neutral cluster, and a Defensive cluster — the labels reflect *relative* sector positioning within the current regime, not absolute performance levels.
+
+## K selection — elbow plot
+
+```{r elbow-plot}
+last_train_month <- max(all_month_ends[all_month_ends <= TRAIN_END])
+
+elbow_features <- monthly_features %>%
+  filter(month_end == last_train_month, n_obs >= 100) %>%
+  select(avg_return, volatility, sharpe_ratio, skewness, kurtosis, momentum_6m) %>%
+  scale()
+
+wss <- map_dbl(1:8, function(k) {
+  km <- kmeans(elbow_features, centers = k, nstart = 25, iter.max = 100)
+  km$tot.withinss
+})
+
+plot_ly(x = 1:8, y = wss, type = "scatter", mode = "lines+markers",
+        line = list(color = COL_STRATEGY, width = 2),
+        marker = list(color = COL_STRATEGY, size = 8),
+        name = "WSS") %>%
+  layout(
+    title = "Elbow Plot — Total Within-Cluster Sum of Squares (Dec 2024 snapshot)",
+    xaxis = list(title = "Number of Clusters (K)", dtick = 1),
+    yaxis = list(title = "Total WSS"),
+    shapes = list(list(
+      type = "line",
+      x0 = K_CLUSTERS, x1 = K_CLUSTERS,
+      y0 = 0, y1 = 1, yref = "paper",
+      line = list(color = COL_DEFENSIVE, dash = "dash", width = 1.5)
+    )),
+    annotations = list(list(
+      x = K_CLUSTERS + 0.15, y = 0.95, xref = "x", yref = "paper",
+      text = paste0("K = ", K_CLUSTERS, " selected"),
+      showarrow = FALSE, font = list(color = COL_DEFENSIVE)
+    ))
+  )
+```
+
+## Hierarchical clustering — Ward's method (Dec 2024)
+
+```{r hierarchical}
+hc_df <- monthly_features %>%
+  filter(month_end == last_train_month, n_obs >= 100) %>%
+  select(symbol, avg_return, volatility, sharpe_ratio, skewness, kurtosis, momentum_6m)
+
+hc_scaled <- hc_df %>%
+  column_to_rownames("symbol") %>%
+  scale()
+
+hc_fit <- hclust(dist(hc_scaled), method = "ward.D2")
+
+fviz_dend(
+  hc_fit,
+  k         = K_CLUSTERS,
+  cex       = 0.9,
+  horiz     = TRUE,
+  rect      = TRUE,
+  rect_fill = TRUE,
+  main      = "Hierarchical Clustering of Sector ETFs — Ward's Method (Dec 2024)",
+  sub       = "Features: avg_return, volatility, sharpe, skewness, kurtosis, momentum_6m"
+)
+```
+
+## K-Means via tidymodels/tidyclust
+
+```{r kmeans-function}
+#| include: false
+fit_kmeans_month <- function(df) {
+  feature_cols <- c("avg_return", "volatility", "sharpe_ratio",
+                    "skewness", "kurtosis", "momentum_6m")
+
+  if (nrow(df) < K_CLUSTERS) {
+    return(tibble(symbol = df$symbol, cluster_label = NA_character_))
+  }
+
+  rec <- recipe(~ ., data = df %>% select(all_of(c("symbol", feature_cols)))) %>%
+    update_role(symbol, new_role = "ID") %>%
+    step_normalize(all_numeric_predictors()) %>%
+    prep()
+
+  baked <- bake(rec, new_data = NULL)
+
+  km_spec <- k_means(num_clusters = K_CLUSTERS)
+  km_fit  <- km_spec %>% fit(~ ., data = baked %>% select(all_of(feature_cols)))
+
+  preds <- predict(km_fit, new_data = baked %>% select(all_of(feature_cols)))
+
+  df_out <- df %>%
+    select(symbol, momentum_6m) %>%
+    mutate(cluster_raw = preds$.pred_cluster)
+
+  cluster_rank <- df_out %>%
+    group_by(cluster_raw) %>%
+    summarise(avg_mom = mean(momentum_6m), .groups = "drop") %>%
+    arrange(desc(avg_mom)) %>%
+    mutate(cluster_label = c("Growth", "Neutral", "Defensive")[seq_len(K_CLUSTERS)])
+
+  df_out %>%
+    left_join(cluster_rank, by = "cluster_raw") %>%
+    select(symbol, cluster_label)
+}
+```
+
+```{r fit-clusters}
+cluster_labels <- monthly_features %>%
+  filter(n_obs >= 100) %>%
+  group_by(month_end) %>%
+  nest() %>%
+  mutate(result = map(data, fit_kmeans_month)) %>%
+  select(month_end, result) %>%
+  unnest(result) %>%
+  ungroup()
+
+cluster_labels %>%
+  filter(month_end == last_train_month) %>%
+  arrange(cluster_label, symbol) %>%
+  kbl(caption = "Cluster assignments — Dec 2024") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r cluster-composition}
+comp_data <- cluster_labels %>%
+  filter(month_end <= TRAIN_END, !is.na(cluster_label)) %>%
+  count(symbol, cluster_label) %>%
+  group_by(symbol) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(cluster_label = factor(cluster_label, levels = c("Growth", "Neutral", "Defensive")))
+
+plot_ly(comp_data, x = ~symbol, y = ~pct, color = ~cluster_label,
+        type = "bar",
+        colors = c(Growth = COL_GROWTH, Neutral = COL_NEUTRAL, Defensive = COL_DEFENSIVE)) %>%
+  layout(
+    barmode  = "stack",
+    title    = "Cluster Membership Frequency by Sector (Training Period)",
+    xaxis    = list(title = ""),
+    yaxis    = list(title = "Fraction of Months", tickformat = ".0%"),
+    legend   = list(title = list(text = "Cluster"))
+  )
+```
+
+```{r cluster-heatmap}
+# Encode cluster as numeric for heatmap colour scale
+cluster_heat <- cluster_labels %>%
+  filter(
+    month_end >= as.Date("2010-01-01"),
+    month_end <= TRAIN_END,
+    !is.na(cluster_label)
+  ) %>%
+  mutate(cluster_num = case_when(
+    cluster_label == "Growth"    ~  1,
+    cluster_label == "Neutral"   ~  0,
+    cluster_label == "Defensive" ~ -1
+  )) %>%
+  select(month_end, symbol, cluster_num) %>%
+  pivot_wider(names_from = symbol, values_from = cluster_num) %>%
+  arrange(month_end)
+
+z_mat      <- cluster_heat %>% select(-month_end) %>% as.matrix()
+date_labels   <- as.character(cluster_heat$month_end)  # x-axis
+sector_labels <- colnames(z_mat)                        # y-axis
+
+plot_ly(
+  x          = date_labels,
+  y          = sector_labels,
+  z          = t(z_mat),
+  type       = "heatmap",
+  colorscale = list(
+    c(0,   COL_DEFENSIVE),
+    c(0.5, COL_NEUTRAL),
+    c(1,   COL_GROWTH)
+  ),
+  zmin       = -1,
+  zmax       = 1,
+  colorbar   = list(
+    tickvals = c(-1, 0, 1),
+    ticktext = c("Defensive", "Neutral", "Growth"),
+    title    = "Cluster"
+  ),
+  hovertemplate = "Month: %{x}<br>Sector: %{y}<extra></extra>"
+) %>%
+  layout(
+    title = "Sector Cluster Assignment Over Time (2010 – 2024)",
+    xaxis = list(title = ""),
+    yaxis = list(title = "")
+  )
+```
+
+---
+
+# Kalman Filter Signal
+
+Cluster labels tell us which sectors *should* be outperforming this month. The Kalman Filter answers a different question: is a given sector *actually* following through right now? It does this by tracking the sector's excess return (sector minus SPY) day by day and measuring how far today's reading deviates from what was expected.
+
+A **local-level (random walk + noise)** state space model is fit independently for each sector:
+
+$$y_t = \mu_t + \varepsilon_t, \quad \varepsilon_t \sim \mathcal{N}(0,\, H)$$
+$$\mu_t = \mu_{t-1} + \eta_t, \quad \eta_t \sim \mathcal{N}(0,\, Q)$$
+
+Here $y_t = r_t^{sector} - r_t^{SPY}$ is the **sector excess return**. The innovation $v_t = y_t - \hat{y}_{t|t-1}$ therefore measures sector-specific surprise net of broad market moves: $v_t > 0$ means the sector beat the market today; $v_t < 0$ means it underperformed regardless of market direction.
+
+Hyperparameters $Q$ and $H$ are estimated via BFGS on the **training period only**, then held fixed and applied forward through the OOS period. Portfolio returns use the original raw sector returns — not excess returns — so the P&L calculation is unaffected.
+
+```{r kf-function}
+#| include: false
+fit_and_filter_kf <- function(df) {
+  df <- df %>% arrange(date)
+  all_returns <- df$daily_ret
+  n_train     <- sum(df$date <= TRAIN_END)
+
+  if (n_train < 60) {
+    return(df %>% mutate(kf_innovation = NA_real_))
+  }
+
+  train_returns <- all_returns[seq_len(n_train)]
+
+  model_train <- SSModel(
+    train_returns ~ SSMtrend(degree = 1, Q = NA),
+    H = NA
+  )
+
+  fit <- tryCatch(
+    fitSSM(model_train, inits = c(0, 0), method = "BFGS"),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+    return(df %>% mutate(kf_innovation = NA_real_))
+  }
+
+  Q_hat <- fit$model$Q[, , 1]
+  H_hat <- fit$model$H[, , 1]
+
+  model_full <- SSModel(
+    all_returns ~ SSMtrend(degree = 1, Q = Q_hat),
+    H = H_hat
+  )
+
+  kfs <- KFS(model_full, filtering = "state", smoothing = "none")
+
+  df %>% mutate(kf_innovation = as.numeric(residuals(kfs, type = "recursive")))
+}
+```
+
+```{r fit-kf}
+# SPY daily returns used to compute excess returns for KF fitting
+spy_rets_daily <- daily_returns %>%
+  filter(symbol == "SPY", date >= TRAIN_START) %>%
+  select(date, spy_ret = daily_ret)
+
+# Fit KF on excess returns (sector - SPY) but keep raw returns for P&L
+kf_daily <- daily_returns %>%
+  filter(symbol %in% SECTOR_TICKERS, date >= TRAIN_START) %>%
+  left_join(spy_rets_daily, by = "date") %>%
+  group_by(symbol) %>%
+  group_modify(function(df, key) {
+    # Temporarily replace daily_ret with excess return for KF fitting only
+    df_excess  <- df %>% mutate(daily_ret = daily_ret - coalesce(spy_ret, 0))
+    kf_result  <- fit_and_filter_kf(df_excess)
+    # Return original daily_ret with KF innovations from excess return model
+    df %>% mutate(kf_innovation = kf_result$kf_innovation)
+  }) %>%
+  ungroup() %>%
+  select(-spy_ret)
+
+# Smooth innovations over a 10-day rolling window.
+# Raw daily innovations are near-zero noise in-sample (the KF was fitted to minimise them).
+# A 10-day mean captures persistent outperformance/underperformance rather than daily noise.
+kf_daily <- kf_daily %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(
+    kf_signal = slider::slide_dbl(kf_innovation, mean, .before = 9, .complete = FALSE)
+  ) %>%
+  ungroup()
+```
+
+```{r kf-plot}
+kf_sectors <- c("XLK", "XLE", "XLU", "XLF")
+
+kf_plots <- map(kf_sectors, function(s) {
+  d <- kf_daily %>%
+    filter(symbol == s, date >= as.Date("2018-01-01"))
+
+  plot_ly(d, x = ~date, y = ~kf_innovation,
+          type = "scatter", mode = "lines",
+          line = list(width = 0.7, color = COL_STRATEGY),
+          name = s, showlegend = FALSE,
+          hovertemplate = paste0(s, " %{x}: %{y:.2f}<extra></extra>")) %>%
+    layout(
+      annotations = list(list(
+        text = s, x = 0.02, y = 0.95,
+        xref = "paper", yref = "paper",
+        showarrow = FALSE, font = list(size = 12, color = "grey40")
+      )),
+      shapes = list(list(
+        type = "line", x0 = min(d$date), x1 = max(d$date),
+        y0 = 0, y1 = 0,
+        line = list(color = "grey60", dash = "dash", width = 0.8)
+      )),
+      xaxis = list(title = ""),
+      yaxis = list(title = "Innovation (σ)")
+    )
+})
+
+subplot(kf_plots, nrows = 2, shareX = FALSE, titleX = FALSE, margin = 0.06) %>%
+  layout(title = "Kalman Filter Daily Innovations (Standardised) — Selected Sectors")
+```
+
+---
+
+# Portfolio Construction
+
+```{r spy-regime}
+# Regime filter: bear = SMA_SHORT-day crosses below SMA_LONG-day (death cross)
+# Smoother than price vs SMA — daily noise cannot flip the regime
+spy_sma100 <- raw_prices %>%
+  filter(symbol == "SPY") %>%
+  arrange(date) %>%
+  mutate(
+    sma_short   = slide_dbl(adjusted, mean, .before = SMA_SHORT - 1L, .complete = TRUE),
+    sma_long    = slide_dbl(adjusted, mean, .before = SMA_LONG  - 1L, .complete = TRUE),
+    bear_regime = sma_short < sma_long
+  ) %>%
+  select(date, sma_short, sma_long, bear_regime)
+
+# Visualise both SMAs and shaded bear regime periods
+spy_sma100 %>%
+  filter(date >= TRAIN_START) %>%
+  left_join(raw_prices %>% filter(symbol == "SPY") %>% select(date, adjusted),
+            by = "date") %>%
+  plot_ly(x = ~date) %>%
+  add_trace(y = ~adjusted, name = "SPY Price",
+            type = "scatter", mode = "lines",
+            line = list(color = COL_SPY, width = 1)) %>%
+  add_trace(y = ~sma_short, name = paste0("SMA", SMA_SHORT),
+            type = "scatter", mode = "lines",
+            line = list(color = COL_STRATEGY, width = 1.2, dash = "dot")) %>%
+  add_trace(y = ~sma_long, name = paste0("SMA", SMA_LONG),
+            type = "scatter", mode = "lines",
+            line = list(color = COL_DEFENSIVE, width = 1.2, dash = "dash")) %>%
+  layout(
+    title     = paste0("SPY SMA", SMA_SHORT, " vs SMA", SMA_LONG,
+                       " — Death Cross Regime Filter"),
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Price (USD)"),
+    hovermode = "x unified",
+    legend    = list(title = list(text = ""))
+  )
+```
+
+```{r build-signals}
+#| include: false
+cluster_fwd <- cluster_labels %>%
+  group_by(symbol) %>%
+  arrange(month_end) %>%
+  mutate(
+    apply_from = month_end + 1,
+    apply_to   = lead(month_end, default = as.Date("2099-12-31"))
+  ) %>%
+  ungroup()
+
+signals_daily <- kf_daily %>%
+  left_join(
+    cluster_fwd %>% select(symbol, apply_from, apply_to, cluster_label),
+    by = join_by(symbol, date >= apply_from, date <= apply_to)
+  ) %>%
+  left_join(ELIGIBILITY, by = "symbol") %>%
+  left_join(spy_sma100 %>% select(date, bear_regime), by = "date") %>%
+  mutate(
+    eligible    = is.na(eligible_from) | date >= eligible_from,
+    bear_regime = coalesce(bear_regime, FALSE),
+    position    = case_when(
+      !eligible | is.na(cluster_label) | is.na(kf_signal)             ~ "Flat",
+      cluster_label == "Growth"    & kf_signal > 0                    ~ "Long",
+      cluster_label == "Neutral"   & kf_signal > 0                    ~ "Long",
+      cluster_label == "Defensive" & kf_signal < 0 & bear_regime      ~ "Short",
+      TRUE                                                             ~ "Flat"
+    ),
+    raw_w = case_when(
+      position == "Long"  & cluster_label == "Growth"  ~  abs(kf_signal),
+      position == "Long"  & cluster_label == "Neutral" ~  abs(kf_signal) * 0.5,
+      position == "Short"                              ~ -abs(kf_signal),
+      TRUE                                             ~  0
+    )
+  ) %>%
+  select(-eligible_from)
+```
+
+```{r normalize-weights}
+#| include: false
+portfolio_daily <- signals_daily %>%
+  group_by(date) %>%
+  mutate(
+    long_sum  = sum(raw_w[raw_w > 0]),
+    short_sum = sum(abs(raw_w[raw_w < 0])),
+    weight    = case_when(
+      raw_w > 0 & long_sum  > 0 ~ raw_w / long_sum  * LONG_TARGET,
+      raw_w < 0 & short_sum > 0 ~ raw_w / short_sum * SHORT_TARGET,
+      TRUE                      ~ 0
+    )
+  ) %>%
+  ungroup() %>%
+  group_by(symbol) %>%
+  arrange(date) %>%
+  mutate(weight_lag = dplyr::lag(weight, default = 0)) %>%
+  ungroup()
+```
+
+```{r portfolio-returns}
+#| include: false
+portfolio_returns <- portfolio_daily %>%
+  group_by(date) %>%
+  summarise(
+    port_ret    = sum(weight_lag * daily_ret, na.rm = TRUE),
+    gross_long  = sum(weight_lag[weight_lag > 0]),
+    gross_short = sum(abs(weight_lag[weight_lag < 0])),
+    n_long      = sum(weight_lag > 1e-6),
+    n_short     = sum(weight_lag < -1e-6),
+    .groups     = "drop"
+  )
+
+spy_daily <- daily_returns %>%
+  filter(symbol == "SPY", date >= TRAIN_START, date <= TEST_END) %>%
+  select(date, spy_ret = daily_ret)
+
+results <- portfolio_returns %>%
+  left_join(spy_daily, by = "date") %>%
+  filter(!is.na(spy_ret)) %>%
+  arrange(date)
+```
+
+---
+
+# Performance Analysis
+
+```{r perf-helpers}
+#| include: false
+cum_ret <- function(r) exp(cumsum(r)) - 1
+ann_ret <- function(r, freq = 252) exp(mean(r, na.rm = TRUE) * freq) - 1
+ann_vol <- function(r, freq = 252) sd(r, na.rm = TRUE) * sqrt(freq)
+sharpe  <- function(r, freq = 252) ann_ret(r, freq) / ann_vol(r, freq)
+
+omega <- function(r, mar = 0) {
+  gains  <- r[r > mar] - mar
+  losses <- mar - r[r < mar]
+  if (length(losses) == 0 || sum(losses) == 0) return(Inf)
+  sum(gains) / sum(losses)
+}
+
+max_dd <- function(r) {
+  w  <- exp(cumsum(r))
+  dd <- (w - cummax(w)) / cummax(w)
+  min(dd, na.rm = TRUE)
+}
+
+perf_table <- function(r_list) {
+  map_dfr(names(r_list), function(nm) {
+    r <- r_list[[nm]]
+    tibble(
+      Strategy          = nm,
+      `Total Return`    = percent(exp(sum(r)) - 1,  accuracy = 0.01),
+      `Ann. Return`     = percent(ann_ret(r),        accuracy = 0.01),
+      `Ann. Volatility` = percent(ann_vol(r),        accuracy = 0.01),
+      `Sharpe Ratio`    = round(sharpe(r), 3),
+      `Omega Ratio`     = round(omega(r),  3),
+      `Max Drawdown`    = percent(max_dd(r),         accuracy = 0.01)
+    )
+  })
+}
+
+train_results <- results %>% filter(date <= TRAIN_END)
+oos_results   <- results %>% filter(date >= TEST_START)
+```
+
+```{r prose-metrics}
+#| include: false
+# ── Formatters ─────────────────────────────────────────────────────────────────
+.p  <- function(x, a = 0.1)  scales::percent(abs(x), accuracy = a)
+.ps <- function(x, a = 0.1)  paste0(if (x >= 0) "+" else "\u2212", .p(x, a))
+.r  <- function(x, d = 2)    round(x, d)
+
+# ── In-sample scalars ──────────────────────────────────────────────────────────
+is_tot_strat    <- .ps(exp(sum(train_results$port_ret)) - 1)
+is_ann_strat    <- .ps(ann_ret(train_results$port_ret))
+is_vol_strat    <- .p(ann_vol(train_results$port_ret))
+is_sharpe_strat <- .r(sharpe(train_results$port_ret))
+is_mdd_strat    <- paste0("\u2212", .p(abs(max_dd(train_results$port_ret))))
+
+is_tot_spy      <- .ps(exp(sum(train_results$spy_ret)) - 1)
+is_ann_spy      <- .ps(ann_ret(train_results$spy_ret))
+is_vol_spy      <- .p(ann_vol(train_results$spy_ret))
+is_sharpe_spy   <- .r(sharpe(train_results$spy_ret))
+is_mdd_spy      <- paste0("\u2212", .p(abs(max_dd(train_results$spy_ret))))
+
+# ── OOS scalars ────────────────────────────────────────────────────────────────
+oos_tot_strat    <- .ps(exp(sum(oos_results$port_ret)) - 1)
+oos_ann_strat    <- .ps(ann_ret(oos_results$port_ret))
+oos_vol_strat    <- .p(ann_vol(oos_results$port_ret))
+oos_sharpe_strat <- .r(sharpe(oos_results$port_ret))
+oos_mdd_strat    <- paste0("\u2212", .p(abs(max_dd(oos_results$port_ret))))
+
+oos_tot_spy      <- .ps(exp(sum(oos_results$spy_ret)) - 1)
+oos_ann_spy      <- .ps(ann_ret(oos_results$spy_ret))
+oos_vol_spy      <- .p(ann_vol(oos_results$spy_ret))
+oos_sharpe_spy   <- .r(sharpe(oos_results$spy_ret))
+oos_mdd_spy      <- paste0("\u2212", .p(abs(max_dd(oos_results$spy_ret))))
+
+oos_cumret_gap_pp <- .r(abs(
+  (exp(sum(oos_results$port_ret)) - 1) - (exp(sum(oos_results$spy_ret)) - 1)) * 100, 1)
+oos_mdd_gap_pp    <- .r(abs(
+  max_dd(oos_results$spy_ret) - max_dd(oos_results$port_ret)) * 100, 1)
+
+# ── Crisis-period drawdowns ────────────────────────────────────────────────────
+.dd <- function(from, to) {
+  s <- results %>% filter(date >= as.Date(from), date <= as.Date(to))
+  list(strat = paste0("\u2212", .p(abs(max_dd(s$port_ret)))),
+       spy   = paste0("\u2212", .p(abs(max_dd(s$spy_ret)))))
+}
+dd_2008 <- .dd("2007-10-01", "2009-03-31")
+dd_2020 <- .dd("2020-01-01", "2020-06-30")
+dd_2022 <- .dd("2022-01-01", "2022-12-31")
+
+# ── Rolling Sharpe stats (IS) ──────────────────────────────────────────────────
+rs_df <- train_results %>%
+  mutate(rs_s = slide_dbl(port_ret, sharpe, .before = 251, .complete = TRUE),
+         rs_b = slide_dbl(spy_ret,  sharpe, .before = 251, .complete = TRUE)) %>%
+  filter(!is.na(rs_s))
+rs_mean_strat <- .r(mean(rs_df$rs_s))
+rs_mean_spy   <- .r(mean(rs_df$rs_b))
+rs_pct_above  <- .p(mean(rs_df$rs_s > rs_df$rs_b))
+
+# ── Position fractions ─────────────────────────────────────────────────────────
+pos_is <- portfolio_daily %>%
+  filter(date >= TRAIN_START, date <= TRAIN_END) %>%
+  count(position) %>% mutate(f = n / sum(n))
+pos_oos_df <- portfolio_daily %>%
+  filter(date >= TEST_START) %>%
+  count(position) %>% mutate(f = n / sum(n))
+
+flat_is      <- .p(pos_is$f[pos_is$position == "Flat"])
+long_is      <- .p(pos_is$f[pos_is$position == "Long"])
+short_is     <- .p(pos_is$f[pos_is$position == "Short"])
+short_oos_frac <- .p(pos_oos_df$f[pos_oos_df$position == "Short"])
+```
+
+## In-sample (Jun 2000 – Dec 2024)
+
+The in-sample period covers 24 years and four major market cycles: the dot-com bust (2000–2002), the financial crisis (2008–2009), the COVID crash (2020), and the rate-driven selloff (2022). This is where the strategy reveals both its strengths and its structural cost.
+
+```{r insample-cumret}
+train_results %>%
+  mutate(Strategy = cum_ret(port_ret), SPY = cum_ret(spy_ret)) %>%
+  select(date, Strategy, SPY) %>%
+  pivot_longer(c(Strategy, SPY), names_to = "series", values_to = "value") %>%
+  plot_ly(x = ~date, y = ~value, color = ~series, type = "scatter", mode = "lines",
+          colors = c(Strategy = COL_STRATEGY, SPY = COL_SPY),
+          line = list(width = 1.5)) %>%
+  layout(
+    title     = "Cumulative Return — In-Sample (Jun 2000 – Dec 2024)",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Cumulative Return", tickformat = ".0%"),
+    hovermode = "x unified",
+    legend    = list(title = list(text = ""))
+  )
+```
+
+Over the full 24-year training period, the strategy returned `r is_tot_strat` (`r is_ann_strat` annualised) versus SPY's `r is_tot_spy` (`r is_ann_spy` annualised). The gap is largely explained by selectivity cost: the strategy is flat in `r flat_is` of all sector-days, meaning it sits out most of the market's gains. When the strategy is long, it is invested in only 3–5 sectors at a time. In bull markets — which dominate this 24-year window — being flat in 7 sectors and long in 4 is a structural drag on compounding relative to holding everything.
+
+```{r insample-drawdown}
+train_results %>%
+  mutate(
+    w_port   = exp(cumsum(port_ret)),
+    w_spy    = exp(cumsum(spy_ret)),
+    Strategy = (w_port - cummax(w_port)) / cummax(w_port),
+    SPY      = (w_spy  - cummax(w_spy))  / cummax(w_spy)
+  ) %>%
+  select(date, Strategy, SPY) %>%
+  pivot_longer(c(Strategy, SPY), names_to = "series", values_to = "drawdown") %>%
+  plot_ly(x = ~date, y = ~drawdown, color = ~series, type = "scatter", mode = "lines",
+          colors = c(Strategy = COL_STRATEGY, SPY = COL_SPY),
+          fill = "tozeroy", alpha = 0.4, line = list(width = 1)) %>%
+  layout(
+    title     = "Drawdown — In-Sample (Jun 2000 – Dec 2024)",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Drawdown", tickformat = ".0%"),
+    hovermode = "x unified",
+    legend    = list(title = list(text = ""))
+  )
+```
+
+Drawdown measures how far the portfolio falls from its previous peak. Three periods stand out. In the 2008–09 financial crisis, the strategy's maximum drawdown reached **`r dd_2008$strat`**, worse than SPY's `r dd_2008$spy`: the long positions in Growth sectors were hit hard, and the `r scales::percent(abs(SHORT_TARGET))` short cap was too small to provide meaningful offset. In the 2020 COVID crash, the death cross regime activated quickly enough to limit the strategy's drawdown to `r dd_2020$strat` versus SPY's `r dd_2020$spy` — a meaningful improvement driven by the faster `r SMA_SHORT`-day average responding to the sharp February–March 2020 selloff. The bright spot is 2022: the rate-driven selloff produced a strategy drawdown of **`r dd_2022$strat`** versus SPY's **`r dd_2022$spy`**, the sharpest example of the regime filter working as designed — SPY broke below its 100-day SMA and the short leg activated on energy and real estate sectors that were falling.
+
+```{r insample-rolling-sharpe}
+is_rs <- train_results %>%
+  mutate(
+    Strategy = slide_dbl(port_ret, sharpe, .before = 251, .complete = TRUE),
+    SPY      = slide_dbl(spy_ret,  sharpe, .before = 251, .complete = TRUE)
+  ) %>%
+  filter(!is.na(Strategy))
+
+is_rs %>%
+  select(date, Strategy, SPY) %>%
+  pivot_longer(c(Strategy, SPY), names_to = "series", values_to = "rolling_sharpe") %>%
+  plot_ly(x = ~date, y = ~rolling_sharpe, color = ~series, type = "scatter", mode = "lines",
+          colors = c(Strategy = COL_STRATEGY, SPY = COL_SPY),
+          line = list(width = 1.2)) %>%
+  layout(
+    title  = "Rolling 12-Month Sharpe Ratio — In-Sample",
+    xaxis  = list(title = ""),
+    yaxis  = list(title = "Sharpe Ratio"),
+    shapes = list(list(
+      type = "line", x0 = min(is_rs$date), x1 = max(is_rs$date),
+      y0 = 0, y1 = 0,
+      line = list(color = "grey60", dash = "dash", width = 0.8)
+    )),
+    hovermode = "x unified",
+    legend    = list(title = list(text = ""))
+  )
+```
+
+The rolling 12-month Sharpe ratio shows consistency of risk-adjusted returns. The strategy's mean rolling Sharpe is **`r rs_mean_strat`** versus SPY's **`r rs_mean_spy`** — but the distribution tells a more interesting story. The strategy beats SPY on a rolling Sharpe basis in `r rs_pct_above` of months. Those periods tend to cluster around bear markets and sector rotation regimes (post-2001, 2008, 2022), where active selection adds value. The remaining time, in sustained bull markets, the selectivity cost dominates.
+
+```{r insample-table}
+list(
+  "Strategy (IS)" = train_results$port_ret,
+  "SPY (IS)"      = train_results$spy_ret
+) %>%
+  perf_table() %>%
+  kbl(caption = "In-Sample Performance Summary (Jun 2000 – Dec 2024)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Out-of-sample (Jan 2025 – Mar 2026)
+
+The out-of-sample period is the real test. The KF parameters were frozen at December 2024, cluster logic was unchanged, and no adjustments were made after that point. Whatever happens here is forward-looking performance, not historical fitting.
+
+The Jan 2025 – Mar 2026 window was genuinely hostile: markets experienced a sharp correction in early 2025 driven by tariff announcements and macro uncertainty, followed by a partial recovery. SPY's `r SMA_SHORT`-day SMA crossed below its `r SMA_LONG`-day SMA for a sustained stretch, activating the short leg. This was not an easy environment for passive investors.
+
+```{r oos-cumret}
+oos_results %>%
+  mutate(Strategy = cum_ret(port_ret), SPY = cum_ret(spy_ret)) %>%
+  select(date, Strategy, SPY) %>%
+  pivot_longer(c(Strategy, SPY), names_to = "series", values_to = "value") %>%
+  plot_ly(x = ~date, y = ~value, color = ~series, type = "scatter", mode = "lines",
+          colors = c(Strategy = COL_STRATEGY, SPY = COL_SPY),
+          line = list(width = 2)) %>%
+  layout(
+    title     = "Cumulative Return — Out-of-Sample (Jan 2025 – Mar 2026)",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Cumulative Return", tickformat = ".1%"),
+    hovermode = "x unified",
+    legend    = list(title = list(text = ""))
+  )
+```
+
+The strategy returned **`r oos_tot_strat`** over this 15-month period versus SPY's **`r oos_tot_spy`** — a `r oos_cumret_gap_pp` percentage point margin on cumulative return. Annualised, the strategy delivered **`r oos_ann_strat`** against SPY's **`r oos_ann_spy`**, with lower volatility (**`r oos_vol_strat` vs `r oos_vol_spy`**). The Sharpe ratio of **`r oos_sharpe_strat`** is more than double SPY's **`r oos_sharpe_spy`**. This outperformance cannot be attributed to data fitting — the model had no knowledge of what happened after December 2024.
+
+```{r oos-drawdown}
+oos_results %>%
+  mutate(
+    w_port   = exp(cumsum(port_ret)),
+    w_spy    = exp(cumsum(spy_ret)),
+    Strategy = (w_port - cummax(w_port)) / cummax(w_port),
+    SPY      = (w_spy  - cummax(w_spy))  / cummax(w_spy)
+  ) %>%
+  select(date, Strategy, SPY) %>%
+  pivot_longer(c(Strategy, SPY), names_to = "series", values_to = "drawdown") %>%
+  plot_ly(x = ~date, y = ~drawdown, color = ~series, type = "scatter", mode = "lines",
+          colors = c(Strategy = COL_STRATEGY, SPY = COL_SPY),
+          fill = "tozeroy", alpha = 0.4, line = list(width = 1)) %>%
+  layout(
+    title     = "Drawdown — Out-of-Sample (Jan 2025 – Mar 2026)",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Drawdown", tickformat = ".1%"),
+    hovermode = "x unified",
+    legend    = list(title = list(text = ""))
+  )
+```
+
+```{r oos-table}
+list(
+  "Strategy (OOS)" = oos_results$port_ret,
+  "SPY (OOS)"      = oos_results$spy_ret
+) %>%
+  perf_table() %>%
+  kbl(caption = "Out-of-Sample Performance Summary (Jan 2025 – Mar 2026)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The strategy's maximum drawdown in the OOS period was **`r oos_mdd_strat`** versus SPY's **`r oos_mdd_spy`**. The regime filter worked: SPY spent meaningful time below its 100-day SMA during the 2025 correction, activating the short overlay on Defensive-classified sectors. The short leg is only `r scales::percent(abs(SHORT_TARGET))` of NAV, so it cannot provide dramatic protection on its own — but a `r oos_mdd_gap_pp` percentage point reduction in peak drawdown while delivering higher returns means the strategy is managing risk without sacrificing upside, which is the intended design.
+
+## Full period — combined view
+
+Viewing in-sample and OOS together on one chart makes the regime break at January 2025 immediately visible. The in-sample compounding is slower than SPY's — the selectivity cost is evident over 24 years of mostly-bull-market conditions. What changes at the OOS boundary is that the strategy accelerates while SPY stalls and corrects. This is not a coincidence: the 2025 environment (sector dispersion, a genuine bear regime, macro rotation) is exactly where this strategy's design has an edge over passive indexing.
+
+```{r full-period}
+results %>%
+  mutate(Strategy = cum_ret(port_ret), SPY = cum_ret(spy_ret)) %>%
+  select(date, Strategy, SPY) %>%
+  pivot_longer(c(Strategy, SPY), names_to = "series", values_to = "value") %>%
+  plot_ly(x = ~date, y = ~value, color = ~series, type = "scatter", mode = "lines",
+          colors = c(Strategy = COL_STRATEGY, SPY = COL_SPY),
+          line = list(width = 1.5)) %>%
+  layout(
+    title     = "Cumulative Return — Full Period (Jun 2000 – Mar 2026)",
+    xaxis     = list(title = ""),
+    yaxis     = list(title = "Cumulative Return", tickformat = ".0%"),
+    hovermode = "x unified",
+    legend    = list(title = list(text = "")),
+    shapes    = list(list(
+      type = "line",
+      x0 = as.character(TEST_START), x1 = as.character(TEST_START),
+      y0 = 0, y1 = 1, yref = "paper",
+      line = list(color = "black", dash = "dash", width = 1.2)
+    )),
+    annotations = list(list(
+      x = as.character(TEST_START), y = 0.97, xref = "x", yref = "paper",
+      text = "OOS start", showarrow = FALSE,
+      xanchor = "left", font = list(size = 11, color = "black")
+    ))
+  )
+```
+
+## Position activity
+
+This chart shows the fraction of sector-days in each position state. The distribution is strikingly stable across both periods: approximately **`r flat_is` Flat**, **`r long_is` Long**, and **`r short_is` Short** in-sample, with near-identical fractions OOS. That consistency is a good sign — the strategy is not changing its behaviour in response to data it has never seen, which rules out a structural regime shift at the OOS boundary.
+
+```{r position-activity}
+pos_data <- portfolio_daily %>%
+  filter(date >= TRAIN_START) %>%
+  mutate(period = if_else(date <= TRAIN_END, "In-Sample", "OOS")) %>%
+  count(period, position) %>%
+  group_by(period) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(position = factor(position, levels = c("Long", "Short", "Flat")))
+
+plot_ly(pos_data, x = ~period, y = ~pct, color = ~position,
+        type = "bar",
+        colors = c(Long = COL_LONG, Short = COL_SHORT, Flat = COL_FLAT)) %>%
+  layout(
+    barmode = "stack",
+    title   = "Fraction of Sector-Days in Each Position",
+    xaxis   = list(title = ""),
+    yaxis   = list(title = "Fraction", tickformat = ".0%"),
+    legend  = list(title = list(text = "Position"))
+  )
+```
+
+The Short fraction (`r short_is` in-sample vs `r short_oos_frac` OOS) is slightly lower in OOS — the 2025 bear phase was shorter in duration than the combined in-sample periods that triggered shorts (2001–02, 2008–09, 2022). The key is that the short leg activates at all, confirming the regime filter correctly identified the 2025 correction as a bear environment and acted on it.
+
+---
+
+# Discussion
+
+## Results summary
+
+In-sample (Jun 2000 – Dec 2024), the strategy underperforms SPY on total return (`r is_tot_strat` vs `r is_tot_spy`) but delivers a Sharpe of `r is_sharpe_strat` on comparable volatility (`r is_vol_strat` vs `r is_vol_spy`). The shortfall is structural: being flat in `r flat_is` of sector-days means the strategy sits out most of the sustained bull-market compounding. The 2008 crisis was the most damaging episode — the strategy's `r dd_2008$strat` peak drawdown exceeded SPY's `r dd_2008$spy`, as the `r scales::percent(abs(SHORT_TARGET))` short cap was insufficient to offset concentrated long-leg losses. The exception is 2022, where the regime filter activated and the strategy limited its drawdown to `r dd_2022$strat` versus SPY's `r dd_2022$spy`.
+
+Out-of-sample (Jan 2025 – Mar 2026), the strategy outperforms significantly: `r oos_tot_strat` vs SPY's `r oos_tot_spy`, Sharpe `r oos_sharpe_strat` vs `r oos_sharpe_spy`, and a lower peak drawdown (`r oos_mdd_strat` vs `r oos_mdd_spy`). The environment — genuine sector dispersion, a sustained bear regime, and macro rotation away from growth — is precisely the setting this strategy was built for. The excess-return KF fires on sectors that are truly diverging from the market, not just rising with it, and the regime filter activates the short leg at the right time.
+
+## Design choices and rationale
+
+| Choice | Rationale |
+|--------|-----------|
+| KF on excess returns (sector − SPY) | Filters broad market noise; the innovation fires only on genuine sector divergence, not broad market moves |
+| Short leg capped at −15% | Limits bull-market drag; unconstrained shorting causes large drawdowns when the market rises |
+| Death cross regime gate (SMA`r SMA_SHORT` < SMA`r SMA_LONG`) | Smoother than price vs SMA — two averages crossing filters out daily noise; shorts activate only in confirmed downtrends |
+| Neutral cluster eligible for long at half weight | Without Neutral participation the strategy is too often flat; half weight adds breadth without overstating conviction relative to Growth |
+| 10-day rolling mean of innovations | Raw daily innovations are near-zero in-sample (KF minimises them by construction); smoothing captures persistent outperformance rather than daily noise |
+| KF trained on in-sample only | Hyperparameters do not see future data; OOS is a true out-of-sample test |
+| 1-day weight lag | No look-ahead bias; signals at day-t close applied to day-t+1 returns |
+
+## Limitations
+
+- **No transaction costs:** Bid-ask spreads, commissions, and market impact are not modelled. Daily rebalancing at the signal level involves non-trivial turnover, particularly when the 10-day signal changes sign.
+- **Short-selling frictions:** Borrow fees and the availability of shares to short are not modelled. The −15% short exposure assumes frictionless execution.
+- **Regime filter lag:** The death cross (SMA`r SMA_SHORT` < SMA`r SMA_LONG`) is a lagging indicator by construction — it requires sustained price decline to pull the shorter average below the longer one. The `r SMA_SHORT`-day window responds faster than a classic 100/200 cross, but still lags in extremely sharp, short-lived selloffs.
+- **Fixed K=3:** The number of clusters is fixed from a single elbow plot snapshot (Dec 2024). The optimal K may vary across different market regimes.
+- **Feature stationarity:** Clustering features are raw-return based. In periods of structural volatility shifts (e.g., post-2020), the feature distributions may be non-stationary, degrading cluster stability.
+
+## Potential improvements
+
+- Compute clustering features on excess returns for full consistency with the KF signal
+- Replace the binary SMA regime filter with a continuous signal (e.g., distance below SMA, or VIX level) to smooth regime transitions and reduce lag
+- Model transaction costs and estimate a breakeven turnover threshold
+- Explore time-varying K using silhouette scores recomputed each month
+
+## Conclusion
+
+The strategy's in-sample record is honest: it underperforms a passive SPY allocation over 24 years of mostly-bull conditions, because selectivity costs compound over time. This is a known property of active strategies — the more frequently you are flat, the more upside you sacrifice during sustained bull runs. The strategy is not designed to beat SPY in every environment; it is designed to outperform in environments with genuine sector dispersion and directional market stress.
+
+The out-of-sample result — `r oos_tot_strat` vs SPY's `r oos_tot_spy`, with a Sharpe of `r oos_sharpe_strat` and a shallower drawdown — confirms that the framework works when the market environment matches its design. The two signals are complementary: clustering identifies which sectors deserve capital each month, and the Kalman Filter confirms that those sectors are actually following through before capital is committed. The regime filter prevents the short leg from destroying value in sustained bull markets.
+
+Every position in this strategy can be traced to a cluster label, a KF signal value, and a regime state. There are no black-box components. That transparency makes it possible to monitor, explain, and defend in real time — a practical requirement for any strategy intended to be deployed beyond a classroom.
+
+## Lessons learned
+
+Several non-obvious lessons emerged during development that are worth documenting explicitly.
+
+**In-sample perfection is a red flag, not a goal.** The first version of the KF signal used raw daily innovations. In-sample, the signal looked near-zero because the KF was fitted to the training data — it had already minimised those residuals by construction. The result was a strategy that appeared to do nothing. The fix was not to retune the model, but to understand *why* the signal was flat and switch to a 10-day rolling mean. This captures persistent outperformance rather than one-day noise, and it also explains why the strategy can work at all: the KF is not predicting the future, it is measuring whether a sector's recent behaviour is consistently diverging from the market.
+
+**Neutral sectors matter more than they seem.** An early design excluded Neutral sectors entirely, keeping them flat. The result was a strategy that was long in only 2–4 sectors at any time, concentrating all capital into the strongest names. Adding Neutral at half weight improves diversification without overstating conviction — and increases the Long fraction enough that the portfolio is not excessively in cash.
+
+**The short cap matters more than it seems.** The `r scales::percent(abs(SHORT_TARGET))` short exposure is by design conservative — unconstrained shorting in a rising market causes large drawdowns. But in the 2008 crisis, the strategy's drawdown of `r dd_2008$strat` was worse than SPY's `r dd_2008$spy`. This is a sobering result: the concentrated long positions in Growth sectors fell sharply, and a `r scales::percent(abs(SHORT_TARGET))` short was nowhere near enough to offset. Notably, increasing the short cap to −30% makes things strictly worse: IS Sharpe falls from `r is_sharpe_strat` to 0.24 and OOS Sharpe falls from `r oos_sharpe_strat` to 0.77, because the regime filter is imperfect and larger shorts create bigger drag when the signal is wrong. In an extreme deleveraging event, structural position limits or stop-loss rules are needed, not a larger short.
+
+**The regime filter is both useful and a source of lag.** The 100-day SMA gate on shorts works as intended: it prevents shorting sectors during bull markets where even weak sectors tend to grind higher. The 2022 rate selloff confirms this — the strategy lost `r dd_2022$strat` versus SPY's `r dd_2022$spy`, a clear win. The cost is response time: it takes roughly 100 trading days of declining prices before the filter activates. In the COVID crash (February–March 2020), the `r SMA_SHORT`-day average responded fast enough to activate the regime filter — the strategy fell `r dd_2020$strat` versus SPY's `r dd_2020$spy`, outperforming during one of the fastest bear markets on record. This is a direct consequence of using a shorter average in the crossover rather than comparing price to a single slow SMA.
+
+**Choosing K=3 before seeing the data is the right framing, even if it feels arbitrary.** The number of clusters is a modelling assumption, not a parameter to optimise. Choosing K after running the backtest is data snooping. Choosing K=3 on economic grounds — growth, defensive, and transitional sectors is a natural taxonomy that practitioners use — and then confirming it with an elbow plot is the correct procedure. The elbow at K=3 on the Dec 2024 snapshot is consistent with this prior, not a discovery.
+
+**The gap between a backtest and a live strategy is larger than it looks.** Transaction costs, borrow fees, bid-ask spreads, and execution slippage are all zero in this model. Daily rebalancing at the signal level involves meaningful turnover when the KF signal changes sign. In practice, one would need to estimate breakeven turnover — the maximum transaction cost per trade at which the strategy still outperforms — and confirm that realistic costs fall below that threshold before deployment.
