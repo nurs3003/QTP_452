@@ -679,6 +679,8 @@ subplot(kf_plots, nrows = 2, shareX = FALSE, titleX = FALSE, margin = 0.06) %>%
   layout(title = "Kalman Filter Daily Innovations (Standardised) — Selected Sectors")
 ```
 
+Each panel shows the daily KF innovation for one sector — positive means the sector beat the market that day, negative means it lagged. A few patterns worth noting: Technology (XLK) tends to run sustained positive streaks during growth-driven bull markets and sharp negative streaks during rate selloffs, which is exactly the kind of persistent signal the 10-day mean is designed to capture. Energy (XLE) is more volatile and mean-reverting, with large spikes that quickly reverse — a pattern that makes a smoothed signal more important than a raw daily read. The zero line acts as the decision threshold: the strategy only acts when the rolling mean has been consistently above or below it, not when a single day spikes through.
+
 ---
 
 # Portfolio Construction
@@ -720,6 +722,10 @@ spy_sma100 %>%
     legend    = list(title = list(text = ""))
   )
 ```
+
+The chart above shows the full history of the two SMAs. Periods where the `r SMA_SHORT`-day SMA drops below the `r SMA_LONG`-day SMA (death cross) are the windows where the short leg is permitted to activate. These periods are relatively infrequent, reflecting the asymmetry of the strategy: it is fundamentally long-biased, using the short leg only as a risk management tool during confirmed downtrends, not as an alpha source.
+
+With the regime signal in place, the three components — cluster labels, KF signal, and bear regime flag — are joined on each trading day to produce a position for every sector. Long positions are sized proportionally to the magnitude of the KF signal (stronger signal = larger weight), normalized so the long leg always sums to `r scales::percent(LONG_TARGET)`. Short positions follow the same logic but are capped at `r scales::percent(abs(SHORT_TARGET))` in aggregate. All weights are lagged by one day before being applied to returns, ensuring no look-ahead bias.
 
 ```{r build-signals}
 #| include: false
@@ -1002,6 +1008,8 @@ list(
   kbl(caption = "In-Sample Performance Summary (Jun 2000 – Dec 2024)") %>%
   kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
 ```
+
+*The Omega ratio is the ratio of total gains above zero to total losses below zero across all daily returns. A value above 1 means the strategy generated more cumulative gain than loss on a day-by-day basis — a fuller picture of return distribution than Sharpe alone, since it captures all moments rather than just mean and variance.*
 
 ## Out-of-sample (Jan 2025 – Mar 2026)
 
